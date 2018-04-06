@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+#
+# git-reltag
+#   add or checkout signed tags based on last tag in branch
+#
+# release:
+#   patch: add new signed tag '<branch>-<X>.<Y>.<Z+1>'
+#   minor: add new signed tag '<branch>-<X>.<Y+1>.0'
+#   major: add new signed tag '<branch>-<X+1>.0.0'
+#   init:  add new signed tag '<branch>-0.0.0' (use for first tag)
+#   match: add new signed tag matching last one (with different branch)
+#
+# deploy:
+#   sync: fetch && verify && checkout, last tag on branch
+#   next: fetch && verify && checkout, next tag on branch
+#   prev: fetch && verify && checkout, previous tag on branch
+#   ver:  fetch && verify && checkout, exact given release tag $1
+#
+# note:
+#   - without args, executes 'patch' if on branch, 'sync' if detached
+#   - refuses action in uncommitted repositories (dirty work area)
+#   - for tagging ops, checkout must have had commits since last tag
+#
+# stat:
+#   - used by author to develop and deploy
+#   - please inform if using
+#
+# scott@smemsh.net
+# http://smemsh.net/src/git-reltag/
+# http://spdx.org/licenses/GPL-2.0
+#
+##############################################################################
+
+# regex of valid identifiers for tag prefix (we use branch name)
+# cf: git-check-ref-format (we only allow a subset for now)
+#
+tagvalids='[[:alnum:]_-/]'
+
+# tags from current checkout are parsed from 'describe' into a
+# $release[] dictionary that contains the commit hash, how many
+# changes we are away from last tag, and what its name was, eg:
+# master-1.0.4-5-g41f7b4f76d51119fe91d2e14c9ea1c021713b015
+#
+relpat=(
+	prefix	"^($tagvalids+)-"
+	major	'([[:digit:]]+)\.'
+	minor	'([[:digit:]]+)\.'
+	patch	'([[:digit:]]+)-'
+	changes	'([[:digit:]]+)-'
+	commit	'g([0-9a-f]+)$'
+)
+
+###
+
+warn        () { echo "$@" >&2; }
+bomb        () { echo "$@" >&2; exit 1; }
+
+strcat      () { strdelim '' "$@"; }
+strdelim    () { (($# > 1)) && { local IFS="$1"; shift; printf -- "$*"; }; }
+
+##############################################################################
+
+verify_sanity_exit ()
+{
+	[[ `git rev-parse --show-toplevel` == $PWD ]] &&
+		[[ `git rev-parse --is-inside-work-tree` == 'true' ]] ||
+			bomb "must start from git worktree toplevel"
+	test -w "$PWD" || bomb "cannot write to gitdir"
+	changes_pending && bomb "aborting while changes are pending"
+}
+
+# - parses 'git describe' (or 'show' for initial tag) into $release[] dict
+# - key in ordered $fields[] maps to numbered expr in $pattern (from $relpat[])
+#
+parse_describe ()
+{
+	local desc=$1
+	local idx val pattern i
+	declare -a fields patterns
+
+	#
+	# create integer-indexed arrays we can use to map associative
+	# indices with parsed substrings from $relpat[] (-> $pattern)
+	#
+	# release[field] = \1 from regex
+	# fields[0] = field name for \1 from regex
+	# fields[1] = field name for \2 from regex, etc
+	# release[$fields[0]] = corresponding field from 'git describe'
+	#
+	# example: release['major'], field[3]='major' ties 3rd
+	#   subexpression in regex to 'major' key in $release[] dict
+	#
+
+	for ((i = 0; i < ${#relpat[@]};)); do
+		fields+=(${relpat[i++]})
+		patterns+=(${relpat[i++]})
+	done
+
+	pattern=`strcat "${patterns[@]}"`
+	if [[ $desc =~ $pattern ]]; then
+		for ((i = 0; i < ${#fields[@]};)); do
+			idx=${fields[i]}
+			val="${BASH_REMATCH[++i]}"
+			release[$idx]="$val"
+		done
+	else
+		bomb "no match for pattern '$pattern'" \
+			"in 'describe' output '$desc'," $'\n' \
+			"try 'init' or use matching head"
+	fi
+}
+
+# store fields corresponding to the checkout in $release[]
+#
+# - prefix of the tag nearest checkout is stored in 'prefix' field
+# - branch name (maybe empty) of current checkout stored in 'branch' field
+# - fields from 'git describe' copied into $release[] via parse_describe()
+# - $message[] populated by "name: val\n" pairs from $release[] for tag message
+#
+slurp_checkout ()
+{
+	local name
+
+	if [[ $command == 'init' ]]
+	then
+		# first tag won't have any of the previous tag info, we
+		# only need to store the commit hash
+		#
+		local commit=`git show --no-patch --pretty=format:%H`
+		[[ $commit ]] ||
+			bomb "unable to determine commit hash"
+		release['commit']="$commit"
+	else
+		# for subsequent tags (when this is not our first run),
+		# read in 'describe' output of the checkout and use it
+		# to reassemble tag name, storing for later test to find
+		# out what offset current checkout is into sorted tag
+		# name array (for deducing relative tags like 'next')
+		#
+		local desc=`git describe --abbrev=999 --long HEAD`
+		[[ $desc ]] ||
+			bomb "no describe output; try init?"
+		release['desc']=$desc
+		parse_describe $desc
+		local tagmembers=(
+			${release['prefix']}-
+			${release['major']}.
+			${release['minor']}.
+			${release['patch']}
+		)
+		release['prior']="`strcat ${tagmembers[@]}`"
+	fi
+
+	###
+
+	# some fields we don't want in the tag message
+	#
+	maybe_append_field_to_tag_message ()
+	{
+		local field=$1; shift
+
+		# message will only even be used when adding a tag
+		#
+		is_tagging_op ||
+			return
+
+		# if args were provided (after we shifted off field name)
+		# and it's not blank,
+		#
+		if (($#)) && [[ $1 ]]
+		then
+			# ...and it's not one of the field names we discard,
+			# (these were only used during construction of tag name
+			# and don't have the correct data that corresponds to
+			# the tag itself, resulting in confusion if put in the
+			# tag message)
+			#
+			if [[
+				$field == 'major' ||
+				$field == 'minor' ||
+				$field == 'patch' \
+			]]; then
+				true; return
+			else
+				# ...then stash field in the tag message array
+				#
+				message+=("$field: $(strcat "$@")")
+			fi
+		else
+			# skip any empty fields
+			true; return
+		fi
+	}
+
+	((debug)) && declare -p release
+
+	# create checkin message with [non-empty] text of all
+	# field names and values, storing result in $message[]
+
+	for name in ${!release[@]}; do
+		maybe_append_field_to_tag_message \
+			$name "${release[$name]}"; done
+}
+
+determine_desired_tag ()
+{
+	local tag ntags
+
+	# note: we narrow possible tags to prefix, which is based on
+	# describe of current checkout (and bypass if $tags['exact'] is set)
+	#
+	taglist=($(git tag --list "${release['prefix']}-*" | sort -V))
+	ntags=${#taglist[@]}
+	tags['last']=${taglist[ntags-1]}
+
+	(($debug)) && declare -p taglist
+	(($debug)) && declare -p release
+
+	for ((i = 0; i < ntags; i++))
+	do
+		if [[ ${tags['exact']} ]]
+		then
+			# tag was specified exactly by the user
+			if [[ ${tags['exact']} == ${taglist[i]} ]]
+			then
+				return
+			fi
+		elif [[ ${taglist[i]} == ${release['prior']} ]]
+		then
+			# relative tags rely on current checkout
+			(($debug)) && set -x
+			tags['cur']=${taglist[i]}
+			tags['prev']=${taglist[i-1]}
+			tags['next']=${taglist[i+1]}
+			(($debug)) && set +x
+			true
+			return
+		fi
+	done
+
+	# no matching tags found
+	#
+	false; return
+}
+
+# make sure to properly obtain exit code of verify
+# pipeline while postprocessing its output
+#
+verify_tag ()
+{
+	# we run this in a subshell to keep pipefail setting,
+	# and do it here to make it obvious during later
+	# code edits to pay attention to verify-tag for security
+	#
+	(
+		set -o pipefail
+		git verify-tag -v $1 2>/dev/null \
+		| awk '/^$/ { while (getline) print $0; }'
+	)
+}
+
+# so we can make sure to run only on clean checkouts
+#
+working_changes () { ! git diff --exit-code &>/dev/null; }
+staged_changes  () { ! git diff --cached --exit-code &>/dev/null; }
+changes_pending () { working_changes || staged_changes; }
+
+##############################################################################
+
+do_checkout ()
+{
+	local tagmember=${1:?}
+	local exactver=$2
+
+	local tag
+	declare -A tags
+
+	is_checkout_op ||
+		bomb "do_checkout invoked for non-checkout scenario"
+
+	if [[ ${release['branch']} ]]
+	then
+		# note: this won't ever happen if invoked
+		# no-args: if on branch, default is to do a
+		# tag, so for this to happen requires 'sync'
+		# to be given explicitly; user would do this
+		# usually after 'init' to detach the head
+		# (declaring it a deploy checkout)
+		#
+		warn "deploying over checked out branch" \
+			"'${release['branch']}'"
+	else
+		((${release['changes']} == 0)) ||
+			bomb "detached checkouts must be at exact tag"
+	fi
+
+	if [[ $command == 'ver' &&
+	      $tagmember == 'exact' &&
+	      $exactver ]]
+	then
+		# tell determine_desired_tag() we want to
+		# bypass calculating a version and go straight
+		# to the designated one (this still verifies
+		# tag exists and has the proper signature)
+		#
+		tags['exact']=${release['prefix']}-$exactver
+	fi
+
+	# determine what tag we match, and the next and
+	# previous ones if we care about those (see $tags[])
+	#
+	determine_desired_tag ||
+		bomb "failed to determine desired tag"
+
+	###
+
+	local tag=${tags[$tagmember]}
+	[[ $tag ]] ||
+		bomb "no '$tagmember' tag found"
+
+	if [[ $tag == ${release['prior']} ]]
+	then
+		if [[ ${release['branch']} ]]
+		then warn "branch head matches desired tag, detaching..."
+		else bomb "desired tag already checked out"
+		fi
+	fi
+
+	verify_tag $tag ||
+		bomb "tag verify failed: '$tag'"
+
+	git checkout -q $tag ||
+		bomb "checkout failed: '$tag'"
+}
+
+do_tag ()
+{
+	local major=$1 minor=$2 patch=$3
+	local tagname
+
+	is_tagging_op ||
+		bomb "do_tag invoked with non-tag operation"
+
+	[[ ${release['branch']} ]] ||
+		bomb "head detached, must be run from a branch"
+
+	if [[ $command == 'match' ]]; then
+		if ! ((${release['forked']})); then
+			bomb "version match meaningless on same branch"; fi; fi
+
+	if [[ $command != 'init' ]]; then
+		if ((${release['changes']} == 0)); then
+			bomb "no changes since last tag made, aborting"; fi; fi
+
+	tagname=${release['branch']}-$major.$minor.$patch
+	message+=("tagname: $tagname")
+
+	msg="$(strdelim $'\n' "${message[@]}")"
+
+	if git tag -s $tagname -F - <<< "$msg"
+	then
+		echo "tag $tagname successfully created, commit message:"
+		echo "$msg"
+	else
+		bomb "tag create failed: '$tagname'"
+	fi
+}
+
+##############################################################################
+
+call ()
+{
+	func=$1; shift
+
+	# in case of unspecified op that we determined was a tag op, we
+	# needed to slurp the checkout before determining which tag op
+	# to use, so we deferred resolution until the actual call()
+	#
+	if [[ $func == 'defer' ]]
+	then
+		# if we're on a rebase fork (as determined earlier) do a
+		# match command or if not, default to incremental patch
+		# if we're on same branch as we were when doing last tag
+		#
+		if [[ ${release['forked']} ]]
+		then func=match
+		else func=patch
+		fi
+	fi
+
+	if [[ `declare -F _$func` ]]
+	then _$func "$@"
+	else warn "$func: unimplemented"; _help; false
+	fi
+}
+
+main ()
+{
+	command=$1; shift
+
+	declare -A release      # fields initialized from current checkout
+	declare -ga message     # carries commit message "field: value" strings
+
+	if [[ $command =~ ^(-h|-?-help)$ ]]; then
+		_help; exit; fi
+
+	verify_sanity_exit "$@"
+
+	# checkout ops: branch name may be empty, indicating deploy checkout
+	# tagging ops: branch name will be used as the tag prefix, and to
+	#   compare to the nearest-tag prefix (from "describe") to see if we
+	#   are on a rebase-fork development branch
+	#
+	release['branch']=`git symbolic-ref --quiet --short HEAD`
+
+	# handle case where no command specified (ie, default action)
+	# which heuristically determines probable desired action
+	#
+	if ! [[ $command ]]
+	then
+		if ! [[ ${release['branch']} ]]
+		then
+			# detached head, assume we're in a deploy checkout
+			command=sync
+		else
+			# if on a branch, we're probably in the dev checkout,
+			# so we want to do a tag operation, but we cannot know
+			# yet if we want to 'match' or 'patch' because we have
+			# not yet slurped the checkout (slurping requires
+			# knowledge of the desired operation, so there's a
+			# chicken-egg dilemma), so in that case, use a special
+			# indirect command to defer selection until call()
+			#
+			command=defer
+		fi
+	fi
+
+	if ! is_valid_op; then
+		warn "$command: unrecognized command"; _help; false; exit; fi
+
+	if is_checkout_op
+	then
+		# update tags before trying to parse 'describe' output
+		# since it determines closest tag
+		git fetch --tags --quiet ||
+			bomb "fetch failure"
+	fi
+
+	# populate $release[] with info from current checkout
+	#
+	slurp_checkout
+
+	# detect the case where we're on a forked branch which we rebase
+	# periodically (in which case "describe" will show the origin branch,
+	# not the branch we're on, since we just tagged the origin prior to a
+	# rebase so it's now the closest tag)
+	#
+	if [[ ${release['branch']} != ${release['prefix']} ]]; then
+		release['forked']=1; fi
+
+	if is_tagging_op
+	then
+		# keep version components in separate global scalars we can
+		# manipulate to build tag name without altering $release[]
+		#
+		declare -g \
+		patchlvl=${release['patch']} \
+		majorlvl=${release['major']} \
+		minorlvl=${release['minor']} \
+		;
+	fi
+
+	call $command "$@" ||
+		bomb "$command: failed"
+}
+
+##############################################################################
+
+is_tagging_op   () { [[ $command =~ ^(init|patch|minor|major|match|defer)$ ]]; }
+is_checkout_op  () { [[ $command =~ ^(sync|next|prev|ver)$ ]]; }
+is_valid_op     () { is_tagging_op || is_checkout_op; }
+
+_init    () { do_tag 0 0 0; }
+_patch   () { do_tag $majorlvl $minorlvl $((++patchlvl)); }
+_minor   () { do_tag $majorlvl $((++minorlvl)) 0; }
+_major   () { do_tag $((++majorlvl)) 0 0; }
+_match   () { do_tag $majorlvl $minorlvl $patchlvl; }	# for rebase forks
+
+_sync    () { do_checkout last; }
+_next    () { do_checkout next; }
+_prev    () { do_checkout prev; }
+_ver     () { do_checkout exact $1; }
+
+_help    () { compgen -A function _ | sed s,.,,; }
+
+##############################################################################
+
+main "$@"
+
